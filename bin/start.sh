@@ -5,5 +5,6 @@ set -e
 echo "Starting the application..."
 echo "Environment: ${ENV:-development}"
 
-# Add your application startup commands here
+FLASK_APP=app.py flask run --host=0.0.0.0 --port=8080 &
+
 echo "Application started successfully!" 
