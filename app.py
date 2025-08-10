@@ -1,3 +1,5 @@
+import random
+import time
 from datetime import datetime
 from flask import Flask, jsonify, request
 from models import db, Conversation, Message
@@ -15,7 +17,6 @@ with app.app_context():
 
 
 def get_or_create_conversation(from_addr, to_addr):
-    """Find existing conversation between two participants, else create one."""
     conversation = Conversation.query.filter(
         or_(
             (Conversation.participant_a == from_addr) & (Conversation.participant_b == to_addr),
@@ -30,6 +31,32 @@ def get_or_create_conversation(from_addr, to_addr):
     return conversation
 
 
+def is_duplicate(provider_id):
+    """Check if a message with the given provider_message_id already exists."""
+    if not provider_id:
+        return False
+    return db.session.query(Message.id).filter_by(provider_message_id=provider_id).first() is not None
+
+
+def mock_provider_send(provider_name, payload):
+    """Simulate sending via provider with random transient failures."""
+    max_retries = 3
+    attempt = 0
+
+    while attempt < max_retries:
+        attempt += 1
+        outcome = random.choice(["success", "500", "429"])
+        if outcome == "success":
+            return True, None
+        elif outcome in ("500", "429"):
+            wait_time = 2 ** attempt
+            print(f"[Provider: {provider_name}] Error {outcome}, retrying in {wait_time}s...")
+            time.sleep(wait_time)
+        else:
+            return False, f"Unexpected error: {outcome}"
+    return False, "Provider failed after retries"
+
+
 def parse_timestamp(ts):
     if not ts:
         return datetime.utcnow()
@@ -38,31 +65,48 @@ def parse_timestamp(ts):
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+# API Endpoints 
 @app.route('/api/messages/sms', methods=['POST'])
 def send_sms():
     data = request.get_json()
+    msg_type = data.get('type', 'sms').lower()
+
+    # Validate attachment rules
+    attachments = data.get('attachments') or []
+    if msg_type == "sms" and attachments:
+        return jsonify({"error": "SMS cannot have attachments"}), 400
+
     conversation = get_or_create_conversation(data.get('from'), data.get('to'))
+
+    # Mock provider send
+    success, error = mock_provider_send("twilio", data)
+    if not success:
+        return jsonify({"error": error}), 502
 
     message = Message(
         conversation_id=conversation.id,
         from_address=data.get('from'),
         to_address=data.get('to'),
         body=data.get('body'),
-        message_type=data.get('type', 'sms'),
-        attachments=data.get('attachments') or [],
+        message_type=msg_type,
+        attachments=attachments,
         provider_message_id=data.get('messaging_provider_id'),
         timestamp=parse_timestamp(data.get('timestamp')),
     )
 
     db.session.add(message)
     db.session.commit()
-    return jsonify({"message": f"{message.message_type.upper()} sent to {data.get('to')}"}), 200
+    return jsonify({"message": f"{msg_type.upper()} sent to {data.get('to')}"}), 200
 
 
 @app.route('/api/messages/email', methods=['POST'])
 def send_email():
     data = request.get_json()
     conversation = get_or_create_conversation(data.get('from'), data.get('to'))
+
+    success, error = mock_provider_send("sendgrid", data)
+    if not success:
+        return jsonify({"error": error}), 502
 
     message = Message(
         conversation_id=conversation.id,
@@ -83,6 +127,10 @@ def send_email():
 @app.route('/api/webhooks/sms', methods=['POST'])
 def incoming_sms_webhook():
     data = request.get_json()
+    provider_id = data.get('messaging_provider_id')
+    if is_duplicate(provider_id):
+        return jsonify({"message": "Duplicate message ignored"}), 200
+
     conversation = get_or_create_conversation(data.get('from'), data.get('to'))
 
     message = Message(
@@ -92,7 +140,7 @@ def incoming_sms_webhook():
         body=data.get('body'),
         message_type=data.get('type', 'sms'),
         attachments=data.get('attachments') or [],
-        provider_message_id=data.get('messaging_provider_id'),
+        provider_message_id=provider_id,
         timestamp=parse_timestamp(data.get('timestamp'))
     )
 
@@ -104,6 +152,10 @@ def incoming_sms_webhook():
 @app.route('/api/webhooks/email', methods=['POST'])
 def incoming_email_webhook():
     data = request.get_json()
+    provider_id = data.get('xillio_id')
+    if is_duplicate(provider_id):
+        return jsonify({"message": "Duplicate message ignored"}), 200
+
     conversation = get_or_create_conversation(data.get('from'), data.get('to'))
 
     message = Message(
@@ -113,7 +165,7 @@ def incoming_email_webhook():
         body=data.get('body'),
         message_type='email',
         attachments=data.get('attachments') or [],
-        provider_message_id=data.get('xillio_id'),
+        provider_message_id=provider_id,
         timestamp=parse_timestamp(data.get('timestamp'))
     )
 
@@ -150,6 +202,6 @@ def get_messages_for_conversation(id):
             "body": message.body,
             "timestamp": message.timestamp.isoformat(),
             "type": message.message_type,
-            "attachments": message.attachments
+            "attachments": message.attachments or []
         })
     return jsonify(result), 200
